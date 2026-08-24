@@ -1,34 +1,21 @@
 """
-YOLO26n Real-Time Person Detection (USB Webcam)
-------------------------------------------------
-Optimized for external USB webcams on machines that also have a built-in
-laptop camera. Key optimizations over a naive capture->predict->show loop:
-
-  1. Threaded capture (CameraStream) — camera I/O runs on its own thread,
-     so the main loop always grabs the LATEST frame instead of blocking
-     on cap.read(). This removes capture latency from the inference loop
-     and prevents frame queue buildup.
-  2. Auto device selection — uses CUDA + FP16 if a GPU is available,
-     falls back to CPU cleanly otherwise.
-  3. model.fuse() — fuses Conv+BN layers for faster inference.
-  4. MJPG FOURCC — most USB webcams only hit their higher FPS/resolution
-     modes when MJPG compression is requested; without it many cams cap
-     out at ~10-15 FPS at 640x480.
-  5. --list-cameras utility — since laptops usually enumerate the
-     built-in camera at index 0, this lets you confirm which index your
-     USB webcam actually is before running detection.
-  6. Zero redundant re-encoding of overlay strings / minimal per-frame
-     Python overhead in the hot loop.
-
-Usage:
-    python yolo_person_detection_optimized.py --list-cameras
-    python yolo_person_detection_optimized.py
+YOLO Dual-Camera Real-Time Analytics Pipeline (OpenVINO CPU Optimized)
+----------------------------------------------------------------------
+Features:
+  1. Camera 1: Object Tracking (ByteTrack) + Vertical Line Crossing Analytics
+     - Left-to-Right crossing: Count IN (+1 Net Present)
+     - Right-to-Left crossing: Count OUT (-1 Net Present)
+  2. Camera 2: Real-time Frame Occupancy / Person Presence Count
+  3. OpenVINO Engine Export & SIMD CPU Acceleration for High FPS
+  4. Multi-threaded Camera Streams to prevent frame buffer I/O blocking
+  5. Side-by-Side Unified Dashboard Visualization Canvas
 """
 
 import argparse
 import os
+import pathlib
 import platform
-import threading
+import sys
 import time
 
 import cv2
@@ -36,154 +23,59 @@ import torch
 from dotenv import load_dotenv
 from ultralytics import YOLO
 
+from src.person_detection.camera import ThreadedCameraStream, get_backend, parse_source
+from src.person_detection.line_counter import LineCrossingTracker
+
 load_dotenv()
 
-
 # ============================================================
-# Configuration (env-overridable)
+# Environment / Default Configurations
 # ============================================================
-
 MODEL_NAME = os.getenv("MODEL_NAME", "yolo26n.pt")
 
-# Reads CAMERA_PATH (used in .env), falling back to CAMERA_SOURCE / CAMERA_INDEX
-RAW_CAMERA_PATH = (
-    os.getenv("CAMERA_PATH")
+RAW_CAM1 = (
+    os.getenv("CAMERA1_SOURCE")
+    or os.getenv("CAMERA_PATH")
     or os.getenv("CAMERA_SOURCE")
     or os.getenv("CAMERA_INDEX")
+    or "0"
+)
+
+RAW_CAM2 = (
+    os.getenv("CAMERA2_SOURCE")
     or "1"
 )
 
-IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "416"))
+IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "320"))
 CONFIDENCE = float(os.getenv("CONFIDENCE", "0.40"))
+LINE_POSITION = float(os.getenv("LINE_POSITION", "0.5"))
 
 CAMERA_WIDTH = int(os.getenv("CAMERA_WIDTH", "640"))
 CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480"))
 CAMERA_FPS = int(os.getenv("CAMERA_FPS", "30"))
 
 PERSON_CLASS = 0  # COCO "person"
-WINDOW_NAME = "YOLO26n Person Detection"
-
+WINDOW_NAME = "Dual Camera Monitor - Tracking (Cam 1) & Occupancy (Cam 2)"
 FPS_SMOOTHING = 0.10
-LOG_EVERY_N_FRAMES = 100
 
-
-def parse_source(source_val):
-    """
-    Parses a source value into either an integer (webcam index) or string (RTSP stream URL / file path).
-    """
-    if source_val is None:
-        return 0
-    source_str = str(source_val).strip()
-    if source_str.isdigit():
-        return int(source_str)
-    try:
-        return int(source_str)
-    except ValueError:
-        return source_str
-
-
-def get_backend(source) -> int:
-    """DirectShow on Windows for local webcam indices; default OpenCV backend for streams/files."""
-    if isinstance(source, int) and platform.system() == "Windows":
-        return cv2.CAP_DSHOW
-    return cv2.CAP_ANY
-
-
-
-# ============================================================
-# Threaded camera reader — always serves the newest frame
-# ============================================================
-
-class CameraStream:
-    def __init__(self, source, width=None, height=None, fps=None):
-        self.source = source
-        backend = get_backend(source)
-        self.cap = cv2.VideoCapture(source, backend)
-
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open video source: {source}")
-
-        # MJPG and fixed resolution settings apply to local hardware webcams (int index)
-        if isinstance(source, int):
-            if width and height:
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            if fps:
-                self.cap.set(cv2.CAP_PROP_FPS, fps)
-
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize stale-frame latency
-
-        self.actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
-
-        self.lock = threading.Lock()
-        self.frame = None
-        self.ret = False
-        self.stopped = False
-
-        # Prime with one synchronous read so the first frame is ready
-        # before the background thread starts.
-        self.ret, self.frame = self.cap.read()
-
-        self.thread = threading.Thread(target=self._update, daemon=True)
-
-    def start(self):
-        self.thread.start()
-        return self
-
-    def _update(self):
-        while not self.stopped:
-            ret, frame = self.cap.read()
-            if not ret:
-                self.stopped = True
-                break
-            with self.lock:
-                self.ret, self.frame = ret, frame
-
-    def read(self):
-        with self.lock:
-            if self.frame is None:
-                return False, None
-            return self.ret, self.frame.copy()
-
-    def stop(self):
-        self.stopped = True
-        self.thread.join(timeout=1.0)
-        self.cap.release()
-
-
-# ============================================================
-# Utility: enumerate local cameras
-# ============================================================
 
 def list_cameras(max_index: int = 6) -> None:
-    print("Scanning camera indices 0.." + str(max_index - 1))
-
+    """Utility function to list available local hardware cameras."""
+    print("\nScanning available camera indices 0.." + str(max_index - 1))
     for i in range(max_index):
         backend = get_backend(i)
         cap = cv2.VideoCapture(i, backend)
         if cap.isOpened():
-            ok, frame = cap.read()
+            ok, _ = cap.read()
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            status = "OK, frame read" if ok else "opened, no frame"
-            print(f"  [{i}] available - {w}x{h} ({status})")
+            status = "OK, frame read" if ok else "Opened, no frame"
+            print(f"  [{i}] Available - {w}x{h} ({status})")
             cap.release()
         else:
-            print(f"  [{i}] not available")
+            print(f"  [{i}] Not available")
+    print("\nSet CAMERA1_SOURCE and CAMERA2_SOURCE in your .env or CLI arguments.")
 
-    print()
-    print("Tip: the built-in laptop webcam is almost always index 0.")
-    print("Your external USB webcam is typically index 1 (or higher if")
-    print("you have more than one extra camera/virtual camera installed).")
-    print("Set CAMERA_INDEX in your .env to the index you want to use.")
-
-
-# ============================================================
-# Device selection
-# ============================================================
 
 def get_device() -> str:
     if torch.cuda.is_available():
@@ -191,165 +83,245 @@ def get_device() -> str:
     return "cpu"
 
 
-# ============================================================
-# Main
-# ============================================================
+def load_or_export_openvino_model(model_name: str, imgsz: int, device: str, force_torch: bool = False):
+    """
+    Loads model. If CPU device and PyTorch weights specified, exports to OpenVINO
+    to leverage SIMD CPU optimization for 2x-4x speedup.
+    """
+    if device == "cuda" or force_torch:
+        print(f"Loading PyTorch model on {device.upper()}...")
+        model = YOLO(model_name)
+        model.to(device)
+        model.fuse()
+        if device == "cuda":
+            model.half()
+        return model, f"PyTorch ({device.upper()})"
+
+    # OpenVINO CPU Acceleration
+    stem = pathlib.Path(model_name).stem
+    openvino_dir = pathlib.Path(f"{stem}_openvino_model")
+
+    if not openvino_dir.exists():
+        print(f"Exporting {model_name} to OpenVINO format for CPU acceleration (imgsz={imgsz})...")
+        base_model = YOLO(model_name)
+        base_model.export(format="openvino", dynamic=True, imgsz=imgsz)
+        print("OpenVINO export completed successfully.")
+
+    print(f"Loading OpenVINO CPU model from: {openvino_dir}")
+    model = YOLO(str(openvino_dir), task="detect")
+    return model, "OpenVINO (CPU)"
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Optimized YOLO person detection")
-    parser.add_argument(
-        "--list-cameras",
-        action="store_true",
-        help="List available local camera indices and exit.",
-    )
-    parser.add_argument(
-        "--source",
-        "--camera-path",
-        "--camera-index",
-        dest="source",
-        type=str,
-        default=None,
-        help="Override CAMERA_PATH from .env for this run (camera index e.g. 0, 1 or stream URL/file path).",
-    )
+    parser = argparse.ArgumentParser(description="Dual-Camera YOLO Analytics & Tracking Pipeline")
+    parser.add_argument("--list-cameras", action="store_true", help="List connected camera indices")
+    parser.add_argument("--source1", type=str, default=None, help="Camera 1 index or stream URL (Line Tracking)")
+    parser.add_argument("--source2", type=str, default=None, help="Camera 2 index or stream URL (Occupancy Count)")
+    parser.add_argument("--imgsz", type=int, default=IMAGE_SIZE, help="Inference resolution size (default: 320)")
+    parser.add_argument("--conf", type=float, default=CONFIDENCE, help="Detection confidence threshold")
+    parser.add_argument("--line-x", type=float, default=LINE_POSITION, help="Vertical line X ratio (0.0 to 1.0)")
+    parser.add_argument("--no-openvino", action="store_true", help="Disable OpenVINO CPU export and use PyTorch")
     args = parser.parse_args()
 
     if args.list_cameras:
         list_cameras()
         return
 
-    raw_source = args.source if args.source is not None else RAW_CAMERA_PATH
-    camera_source = parse_source(raw_source)
+    cam1_src = parse_source(args.source1 if args.source1 is not None else RAW_CAM1)
+    cam2_src = parse_source(args.source2 if args.source2 is not None else RAW_CAM2)
 
     device = get_device()
-    use_half = device == "cuda"
 
-    print("=" * 60)
-    print("YOLO26n Person Detection")
-    print("=" * 60)
-    print(f"Device: {device}{' (FP16)' if use_half else ''}")
-    print(f"Video Source: {camera_source}")
+    print("=" * 65)
+    print("Dual Camera Analytics Pipeline")
+    print("=" * 65)
+    print(f"Camera 1 (Line Tracker) : {cam1_src}")
+    print(f"Camera 2 (Occupancy)    : {cam2_src}")
+    print(f"Inference Resolution    : {args.imgsz}x{args.imgsz}")
+    print(f"Confidence Threshold    : {args.conf}")
 
-    # --------------------------------------------------------
-    # Load model
-    # --------------------------------------------------------
+    # Load Model
     t0 = time.perf_counter()
-    model = YOLO(MODEL_NAME)
-    model.to(device)
-    model.fuse()  # fold Conv+BatchNorm for faster inference
-    if use_half:
-        model.half()  # set FP16 weights once, instead of passing half= per call
-    print(f"Model loaded in {time.perf_counter() - t0:.2f}s")
+    model, engine_info = load_or_export_openvino_model(
+        MODEL_NAME, args.imgsz, device, force_torch=args.no_openvino
+    )
+    print(f"Engine Ready: {engine_info} (Loaded in {time.perf_counter() - t0:.2f}s)")
 
-    # --------------------------------------------------------
-    # Open camera / stream (threaded)
-    # --------------------------------------------------------
-    print(f"\nOpening video source: {camera_source}...")
+    # Open Camera Streams
+    print("\nInitializing camera streams...")
     try:
-        stream = CameraStream(
-            camera_source, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS
-        ).start()
-    except RuntimeError as e:
-        print(f"ERROR: {e}")
-        print("Run with --list-cameras to see available camera indices.")
+        stream1 = ThreadedCameraStream(cam1_src, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS).start()
+    except Exception as e:
+        print(f"ERROR starting Camera 1 ({cam1_src}): {e}")
+        print("Run 'python main.py --list-cameras' to inspect hardware camera indices.")
         return
 
-    print(
-        f"Stream ready: {stream.actual_width}x{stream.actual_height} "
-        f"@ {stream.actual_fps:.1f} FPS"
-    )
-
-    ret, frame = stream.read()
-    if not ret or frame is None:
-        print("ERROR: Could not read an initial frame from the video source.")
-        stream.stop()
+    try:
+        stream2 = ThreadedCameraStream(cam2_src, CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS).start()
+    except Exception as e:
+        print(f"ERROR starting Camera 2 ({cam2_src}): {e}")
+        print("Stopping Camera 1 stream.")
+        stream1.stop()
         return
 
-    # --------------------------------------------------------
-    # Warm-up (first inference is always slower — CUDA context /
-    # graph build / kernel autotune, so do it before timing loop)
-    # --------------------------------------------------------
-    print("Warming up model...")
-    t0 = time.perf_counter()
-    model.predict(
-        source=frame,
-        imgsz=IMAGE_SIZE,
-        conf=CONFIDENCE,
-        classes=[PERSON_CLASS],
-        device=device,
-        verbose=False,
-    )
-    print(f"Warm-up done in {time.perf_counter() - t0:.2f}s")
+    print(f"Cam 1 Stream: {stream1.actual_width}x{stream1.actual_height} @ {stream1.actual_fps:.1f} FPS")
+    print(f"Cam 2 Stream: {stream2.actual_width}x{stream2.actual_height} @ {stream2.actual_fps:.1f} FPS")
 
-    print("\nDetection started. Press Q to quit.\n")
+    # Warm-up model
+    ret1, f1 = stream1.read()
+    ret2, f2 = stream2.read()
+    if ret1 and f1 is not None:
+        print("Warming up inference engine...")
+        model.predict(f1, imgsz=args.imgsz, conf=args.conf, classes=[PERSON_CLASS], verbose=False)
+        print("Warm-up complete.")
+
+    line_tracker = LineCrossingTracker(line_ratio=args.line_x)
+
+    print("\nAnalytics active. Press Q to exit visual dashboard.\n")
 
     previous_time = time.perf_counter()
     fps = 0.0
     frame_count = 0
-    inference_time = 0.0
 
     try:
         while True:
-            ret, frame = stream.read()
-            if not ret or frame is None:
-                # Camera thread hasn't produced a new frame yet / died.
-                if stream.stopped:
-                    print("ERROR: Camera stream stopped unexpectedly.")
+            ret1, frame1 = stream1.read()
+            ret2, frame2 = stream2.read()
+
+            if not ret1 or frame1 is None or not ret2 or frame2 is None:
+                if stream1.stopped or stream2.stopped:
+                    print("Camera stream disconnected or stopped.")
                     break
+                time.sleep(0.005)
                 continue
 
             infer_start = time.perf_counter()
-            results = model.predict(
-                source=frame,
-                imgsz=IMAGE_SIZE,
-                conf=CONFIDENCE,
+
+            # --- Camera 1: ByteTrack + Line Crossing Analytics ---
+            results1 = model.track(
+                source=frame1,
+                persist=True,
+                tracker="bytetrack.yaml",
+                imgsz=args.imgsz,
+                conf=args.conf,
                 classes=[PERSON_CLASS],
-                device=device,
                 verbose=False,
             )
-            inference_time = time.perf_counter() - infer_start
 
-            person_count = len(results[0].boxes)
-            annotated = results[0].plot()
+            boxes1 = None
+            track_ids1 = None
+            if len(results1) > 0 and results1[0].boxes is not None:
+                boxes_tensor = results1[0].boxes.xyxy.cpu().numpy()
+                if results1[0].boxes.id is not None:
+                    ids_tensor = results1[0].boxes.id.int().cpu().numpy()
+                    boxes1 = boxes_tensor
+                    track_ids1 = ids_tensor
 
+            annotated1 = line_tracker.update_and_draw(frame1, boxes1, track_ids1)
+
+            # Draw Cam 1 Header Banner
+            cv2.putText(
+                annotated1,
+                f"CAM 1: LINE CROSSING [{cam1_src}]",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            # --- Camera 2: Person Occupancy Count ---
+            results2 = model.predict(
+                source=frame2,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                classes=[PERSON_CLASS],
+                verbose=False,
+            )
+
+            person_count_cam2 = len(results2[0].boxes) if len(results2) > 0 else 0
+            annotated2 = results2[0].plot()
+
+            # Overlay Cam 2 Banner & Occupancy Metrics
+            h2, w2 = annotated2.shape[:2]
+            cv2.putText(
+                annotated2,
+                f"CAM 2: OCCUPANCY [{cam2_src}]",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            overlay2 = annotated2.copy()
+            cv2.rectangle(overlay2, (10, h2 - 70), (240, h2 - 10), (0, 0, 0), -1)
+            cv2.addWeighted(overlay2, 0.6, annotated2, 0.4, 0, annotated2)
+
+            cv2.putText(
+                annotated2,
+                f"PERSONS VISIBLE: {person_count_cam2}",
+                (20, h2 - 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+            infer_duration = time.perf_counter() - infer_start
+
+            # Calculate FPS
             now = time.perf_counter()
             elapsed = now - previous_time
             previous_time = now
             if elapsed > 0:
-                current_fps = 1.0 / elapsed
-                fps = current_fps if fps == 0 else (
-                    FPS_SMOOTHING * current_fps + (1 - FPS_SMOOTHING) * fps
-                )
+                cur_fps = 1.0 / elapsed
+                fps = cur_fps if fps == 0 else (FPS_SMOOTHING * cur_fps + (1 - FPS_SMOOTHING) * fps)
 
-            source_disp = str(camera_source)
-            if len(source_disp) > 25:
-                source_disp = source_disp[:22] + "..."
+            # Resize frame2 to match frame1 height if different
+            h1, w1 = annotated1.shape[:2]
+            if h2 != h1:
+                new_w2 = int(w2 * (h1 / h2))
+                annotated2 = cv2.resize(annotated2, (new_w2, h1))
 
-            cv2.putText(annotated, f"FPS: {fps:.1f}", (20, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(annotated, f"Persons: {person_count}", (20, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(annotated, f"Source: {source_disp}", (20, 105),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(annotated, f"Inference: {inference_time * 1000:.0f} ms ({device})",
-                        (20, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
+            # Combine Side-by-Side Canvas
+            canvas = cv2.hconcat([annotated1, annotated2])
 
-            cv2.imshow(WINDOW_NAME, annotated)
+            # Draw Global Top FPS & System Status Bar
+            cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 25), (30, 30, 30), -1)
+            status_str = f"FPS: {fps:.1f} | Latency: {infer_duration * 1000:.0f} ms | Engine: {engine_info}"
+            cv2.putText(
+                canvas,
+                status_str,
+                (15, 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.imshow(WINDOW_NAME, canvas)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
             frame_count += 1
-            if frame_count % LOG_EVERY_N_FRAMES == 0:
+            if frame_count % 100 == 0:
                 print(
-                    f"FPS: {fps:.1f} | Inference: {inference_time * 1000:.1f} ms "
-                    f"| Persons: {person_count}"
+                    f"FPS: {fps:.1f} | Latency: {infer_duration * 1000:.1f}ms | "
+                    f"Cam 1 Net: {line_tracker.net_count} | Cam 2 Occupancy: {person_count_cam2}"
                 )
 
     finally:
-        print("\nStopping...")
-        stream.stop()
+        print("\nStopping camera streams...")
+        stream1.stop()
+        stream2.stop()
         cv2.destroyAllWindows()
-        print("Program stopped.")
+        print("System shutdown complete.")
 
 
 if __name__ == "__main__":
