@@ -117,16 +117,11 @@ class LineCrossingTracker:
                 )
                 cv2.circle(frame, (cx, cy), 4, (0, 255, 255), -1)
 
-        # Cleanup stale tracks
-        stale_ids = [tid for tid in list(self.track_history.keys()) if tid not in current_active_ids]
+        # Cleanup stale tracks immediately
+        stale_ids = set(self.track_history.keys()) - current_active_ids
         for tid in stale_ids:
-            # retain last state for a few frames or clean up
-            if len(self.track_history[tid]) > 0:
-                self.track_history[tid].popleft()
-            if len(self.track_history[tid]) == 0:
-                del self.track_history[tid]
-                if tid in self.track_state:
-                    del self.track_state[tid]
+            del self.track_history[tid]
+            self.track_state.pop(tid, None)
 
         # Draw summary overlay box on Camera 1 frame
         overlay = frame.copy()

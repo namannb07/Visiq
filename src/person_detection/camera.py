@@ -60,9 +60,13 @@ class ThreadedCameraStream:
         self.frame = None
         self.ret = False
         self.stopped = False
+        self.last_frame_time = time.monotonic()
+        self._STALL_TIMEOUT = 5.0  # seconds before declaring camera stalled
 
         # Prime first frame
         self.ret, self.frame = self.cap.read()
+        if self.ret:
+            self.last_frame_time = time.monotonic()
         self.thread = threading.Thread(target=self._update, daemon=True)
 
     def start(self):
@@ -70,13 +74,31 @@ class ThreadedCameraStream:
         return self
 
     def _update(self):
+        consecutive_failures = 0
         while not self.stopped:
             ret, frame = self.cap.read()
             if not ret:
-                self.stopped = True
-                break
+                consecutive_failures += 1
+                if consecutive_failures > 30:
+                    # Attempt to reopen the camera once before giving up
+                    print(f"[Camera {self.source}] Too many read failures, attempting reopen...")
+                    self.cap.release()
+                    time.sleep(0.5)
+                    backend = get_backend(self.source)
+                    self.cap = cv2.VideoCapture(self.source, backend)
+                    if not self.cap.isOpened():
+                        print(f"[Camera {self.source}] Reopen failed. Stopping.")
+                        self.stopped = True
+                        break
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    consecutive_failures = 0
+                    continue
+                time.sleep(0.005)
+                continue
+            consecutive_failures = 0
             with self.lock:
                 self.ret, self.frame = ret, frame
+                self.last_frame_time = time.monotonic()
             time.sleep(0.001)
 
     def read(self):
@@ -84,6 +106,12 @@ class ThreadedCameraStream:
             if self.frame is None:
                 return False, None
             return self.ret, self.frame.copy()
+
+    @property
+    def is_healthy(self) -> bool:
+        """Returns False if no new frame has arrived within the stall timeout."""
+        with self.lock:
+            return (time.monotonic() - self.last_frame_time) < self._STALL_TIMEOUT
 
     def stop(self):
         self.stopped = True

@@ -182,6 +182,8 @@ def main():
     previous_time = time.perf_counter()
     fps = 0.0
     frame_count = 0
+    TRACKER_RESET_INTERVAL = 300  # Reset tracker state every N frames
+    TRACK_LATENCY_THRESHOLD = 2.0  # seconds — if model.track() exceeds this, reset immediately
 
     try:
         while True:
@@ -192,12 +194,26 @@ def main():
                 if stream1.stopped or stream2.stopped:
                     print("Camera stream disconnected or stopped.")
                     break
+                # Pump the GUI message queue even when no frames are available
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
                 time.sleep(0.005)
                 continue
+
+            # Check camera health — warn if a camera stream has stalled
+            if not stream1.is_healthy:
+                print(f"WARNING: Camera 1 stream appears stalled (no new frames for {stream1._STALL_TIMEOUT}s)")
+            if not stream2.is_healthy:
+                print(f"WARNING: Camera 2 stream appears stalled (no new frames for {stream2._STALL_TIMEOUT}s)")
+
+            # Pump GUI before inference to ensure window is responsive
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
             infer_start = time.perf_counter()
 
             # --- Camera 1: ByteTrack + Line Crossing Analytics ---
+            track_start = time.perf_counter()
             results1 = model.track(
                 source=frame1,
                 persist=True,
@@ -207,6 +223,21 @@ def main():
                 classes=[PERSON_CLASS],
                 verbose=False,
             )
+            track_duration = time.perf_counter() - track_start
+
+            # Adaptive reset: if model.track() took too long, tracker state has grown too large
+            if track_duration > TRACK_LATENCY_THRESHOLD:
+                if hasattr(model, 'predictor') and model.predictor is not None:
+                    if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
+                        for tracker in model.predictor.trackers:
+                            tracker.reset()
+                        print(
+                            f"[Frame {frame_count}] Adaptive tracker reset triggered "
+                            f"(track latency: {track_duration:.2f}s > {TRACK_LATENCY_THRESHOLD}s)"
+                        )
+                # Pump GUI immediately after a long inference to prevent freeze
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
 
             boxes1 = None
             track_ids1 = None
@@ -230,6 +261,10 @@ def main():
                 2,
                 cv2.LINE_AA,
             )
+
+            # Pump GUI between inference calls to prevent window freeze
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
             # --- Camera 2: Person Occupancy Count ---
             results2 = model.predict(
@@ -310,6 +345,15 @@ def main():
                 break
 
             frame_count += 1
+
+            # Periodically reset the internal tracker to prevent state accumulation
+            if frame_count % TRACKER_RESET_INTERVAL == 0:
+                if hasattr(model, 'predictor') and model.predictor is not None:
+                    if hasattr(model.predictor, 'trackers') and model.predictor.trackers:
+                        for tracker in model.predictor.trackers:
+                            tracker.reset()
+                        print(f"[Frame {frame_count}] ByteTrack tracker state reset.")
+
             if frame_count % 100 == 0:
                 print(
                     f"FPS: {fps:.1f} | Latency: {infer_duration * 1000:.1f}ms | "
